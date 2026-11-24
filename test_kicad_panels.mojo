@@ -86,6 +86,10 @@ def main() raises:
     _ = _p_write(tmp_kc + String("/pcbnew/pcb_edit_frame.cpp"), _p_read(real_kc + String("/pcbnew/pcb_edit_frame.cpp")))
     _ = _p_write(tmp_kc + String("/pcbnew/menubar_pcb_editor.cpp"), _p_read(real_kc + String("/pcbnew/menubar_pcb_editor.cpp")))
 
+    var real_plug_json = _p_read(String("/Users/bee/Hacking/theoretical-aided-pcb/kicad_plugin/plugin.json"))
+    var real_parsed = kp_parse_manifest_json(real_plug_json, String("/Users/bee/Hacking/theoretical-aided-pcb/kicad_plugin"))
+    _must(len(real_parsed) == 1 and real_parsed[0].panel_id == String("blossom-physics") and real_parsed[0].height == 760 and real_parsed[0].entrypoint == String("blossom_pcb"), "real_plugin_json_manifest")
+
     var n1 = apply_kicad_panels_patch(tmp_kc, repo_dir, False)
     var n2 = apply_kicad_panels_patch(tmp_kc, repo_dir, False)
     var patched_menu = _p_read(tmp_kc + String("/pcbnew/menubar_pcb_editor.cpp"))
@@ -93,4 +97,4 @@ def main() raises:
     var copied_host = _p_read(tmp_kc + String("/pcbnew/widgets/panel_plugin_host.cpp"))
     _must(n1 == 6 and n2 == 6 and _p_find(patched_menu, String("PANEL_PLUGIN_REGISTRY::PopulateMenu")) >= 0 and _p_find(patched_frame, String("PANEL_PLUGIN_REGISTRY::Attach")) >= 0 and copied_host.byte_length() > 1000, "idempotent_anchor_patch")
 
-    print("KICAD_PANELS_SUITE_PASS: shm_abi=OK | manifest_discovery=OK | anchor_patch_idempotent=OK")
+    print("KICAD_PANELS_SUITE_PASS: shm_abi=OK | manifest_discovery=OK | real_plugin_json=OK | anchor_patch_idempotent=OK")

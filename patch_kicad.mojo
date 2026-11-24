@@ -118,7 +118,7 @@ def apply_kicad_panels_patch(kicad_root: String, panels_repo: String, dry_run: B
         fc1,
         String("    RestoreAuiLayout();\n"),
         String("PANEL_PLUGIN_REGISTRY::Attach"),
-        String("    m_pluginPanels = PANEL_PLUGIN_REGISTRY::Attach( this, m_auimgr );\n"),
+        String("    m_pluginPanels = PANEL_PLUGIN_REGISTRY::Attach( this, m_auimgr );\n    ReCreateMenuBar();\n"),
     )
     var new_frame_c = inject_after_anchor(
         fc2,

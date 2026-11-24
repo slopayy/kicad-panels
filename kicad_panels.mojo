@@ -157,6 +157,26 @@ def kp_request_width(p: KpPanel, req_w: Int):
     var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     i32[unsafe_offset=6] = Int32(clamp(req_w, 64, KP_MAX_DIM))
 
+def kp_request_host_toggle(shm_spec: String = String("dev.bee.theoretical-aided-pcb.blossom-physics")) -> Bool:
+    var path = kp_shm_file_path(shm_spec)
+    var pc = path + String("\0")
+    var fd = external_call["open", Int32](pc.unsafe_ptr(), Int32(0x0002))
+    _ = pc
+    if fd < Int32(0):
+        return False
+    var addr = external_call["mmap", Int](Int(0), KP_FB_OFF, Int32(3), Int32(1), fd, Int64(0))
+    _ = external_call["close", Int32](fd)
+    if addr == -1 or addr == 0:
+        return False
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=addr)
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=addr)
+    var ok = False
+    if Atomic.load(u32.unsafe_offset(0)) == KP_MAGIC and (i32[unsafe_offset=7] & Int32(2)) != Int32(0):
+        i32[unsafe_offset=7] = i32[unsafe_offset=7] | Int32(32)
+        ok = True
+    _ = external_call["munmap", Int32](addr, KP_FB_OFF)
+    return ok
+
 def kp_set_key_focus(p: KpPanel, want_key: Bool):
     if p.shm_addr == 0:
         return

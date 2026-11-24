@@ -32,6 +32,8 @@ public:
 
     void EnsurePluginRunning();
     void StopPluginProcess();
+    bool ConsumeToggleRequest();
+    int PollRequestedWidth();
     void TickFromRegistry( double aWxMm, double aWyMm, double aZoomMpp, int aLayer, uint32_t aCanvasFlags );
     const std::string& PaneName() const { return m_paneName; }
     const std::string& MenuTitle() const { return m_spec.title; }

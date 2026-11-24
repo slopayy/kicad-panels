@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -46,53 +47,77 @@ std::string SanitizeKey( const std::string& aRaw )
     return out.empty() ? "default" : out;
 }
 
+void ScanPluginsDir( const std::string& aRoot, std::vector<PLUGIN_PANEL_SPEC>& aOut )
+{
+    if( aRoot.empty() )
+        return;
+    DIR* dp = ::opendir( aRoot.c_str() );
+    if( !dp )
+        return;
+    while( struct dirent* ent = ::readdir( dp ) )
+    {
+        std::string subName( ent->d_name );
+        if( subName.empty() || subName == "." || subName == ".." )
+            continue;
+        std::string subDir = aRoot + "/" + subName;
+        struct stat stDir{};
+        if( ::stat( subDir.c_str(), &stDir ) != 0 || !S_ISDIR( stDir.st_mode ) )
+            continue;
+        std::string pjPath = subDir + "/plugin.json";
+        struct stat stPj{};
+        if( ::stat( pjPath.c_str(), &stPj ) != 0 || !S_ISREG( stPj.st_mode ) )
+            continue;
+        std::ifstream ifs( pjPath );
+        nlohmann::json doc = nlohmann::json::parse( ifs, nullptr, false );
+        if( !doc.is_object() || !doc.contains( "panels" ) || !doc["panels"].is_array() )
+            continue;
+        std::string plugId = doc.value( "identifier", subName );
+        for( const auto& item : doc["panels"] )
+        {
+            if( !item.is_object() )
+                continue;
+            PLUGIN_PANEL_SPEC sp;
+            sp.plugin_id = plugId;
+            sp.panel_id = item.value( "identifier", "" );
+            sp.title = item.value( "name", sp.panel_id );
+            sp.dock_side = item.value( "dock", "left" );
+            std::string ep = item.value( "entrypoint", "" );
+            sp.init_w = item.value( "width", 324 );
+            sp.init_h = item.value( "height", 720 );
+            if( item.contains( "args" ) && item["args"].is_array() )
+            {
+                for( const auto& a : item["args"] )
+                    if( a.is_string() )
+                        sp.args.push_back( a.get<std::string>() );
+            }
+            if( sp.panel_id.empty() || ep.empty() )
+                continue;
+            bool dup = false;
+            for( const auto& ex : aOut )
+            {
+                if( ex.plugin_id == sp.plugin_id && ex.panel_id == sp.panel_id )
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if( !dup )
+            {
+                sp.exe_path = subDir + "/" + ep;
+                aOut.push_back( sp );
+            }
+        }
+    }
+    ::closedir( dp );
+}
+
 std::vector<PLUGIN_PANEL_SPEC> DiscoverSpecs()
 {
     std::vector<PLUGIN_PANEL_SPEC> specs;
-    wxString rootPath = PATHS::GetUserPluginsPath();
-    if( !wxDir::Exists( rootPath ) )
-        return specs;
-    wxDir dir( rootPath );
-    wxString subName;
-    bool cont = dir.GetFirst( &subName, wxEmptyString, wxDIR_DIRS );
-    while( cont )
-    {
-        wxFileName pj( rootPath + "/" + subName, "plugin.json" );
-        if( pj.FileExists() )
-        {
-            std::ifstream ifs( pj.GetFullPath().ToStdString() );
-            nlohmann::json doc = nlohmann::json::parse( ifs, nullptr, false );
-            if( doc.is_object() && doc.contains( "panels" ) && doc["panels"].is_array() )
-            {
-                std::string plugId = doc.value( "identifier", subName.ToStdString() );
-                for( const auto& item : doc["panels"] )
-                {
-                    if( !item.is_object() )
-                        continue;
-                    PLUGIN_PANEL_SPEC sp;
-                    sp.plugin_id = plugId;
-                    sp.panel_id = item.value( "identifier", "" );
-                    sp.title = item.value( "name", sp.panel_id );
-                    sp.dock_side = item.value( "dock", "left" );
-                    std::string ep = item.value( "entrypoint", "" );
-                    sp.init_w = item.value( "width", 324 );
-                    sp.init_h = item.value( "height", 720 );
-                    if( item.contains( "args" ) && item["args"].is_array() )
-                    {
-                        for( const auto& a : item["args"] )
-                            if( a.is_string() )
-                                sp.args.push_back( a.get<std::string>() );
-                    }
-                    if( !sp.panel_id.empty() && !ep.empty() )
-                    {
-                        sp.exe_path = ( rootPath + "/" + subName + "/" + wxString::FromUTF8( ep ) ).ToStdString();
-                        specs.push_back( sp );
-                    }
-                }
-            }
-        }
-        cont = dir.GetNext( &subName );
-    }
+    ScanPluginsDir( PATHS::GetUserPluginsPath().ToStdString(), specs );
+    std::string pcmRoot = PATHS::GetDefault3rdPartyPath().ToStdString();
+    ScanPluginsDir( pcmRoot + "/plugins", specs );
+    ScanPluginsDir( pcmRoot, specs );
     return specs;
 }
 }
@@ -196,6 +221,29 @@ void PANEL_PLUGIN_SURFACE::StopPluginProcess()
         ::waitpid( static_cast<pid_t>( m_childPid ), nullptr, WNOHANG );
         m_childPid = -1;
     }
+}
+
+bool PANEL_PLUGIN_SURFACE::ConsumeToggleRequest()
+{
+    if( !m_shmAddr )
+        return false;
+    auto* i32 = static_cast<int32_t*>( m_shmAddr );
+    if( ( i32[7] & 32 ) == 0 )
+        return false;
+    i32[7] &= ~32;
+    return true;
+}
+
+int PANEL_PLUGIN_SURFACE::PollRequestedWidth()
+{
+    if( !m_shmAddr )
+        return 0;
+    auto* i32 = static_cast<const int32_t*>( m_shmAddr );
+    int rw = std::max( 64, std::min( KP_MAX_DIM_V, static_cast<int>( i32[6] ) ) );
+    if( rw == m_lastReqW )
+        return 0;
+    m_lastReqW = rw;
+    return rw;
 }
 
 void PANEL_PLUGIN_SURFACE::TickFromRegistry( double aWxMm, double aWyMm, double aZoomMpp, int aLayer, uint32_t aCanvasFlags )
@@ -396,7 +444,6 @@ PANEL_PLUGIN_REGISTRY::PANEL_PLUGIN_REGISTRY( PCB_EDIT_FRAME* aFrame, wxAuiManag
         int lastId = m_baseMenuId + static_cast<int>( m_surfaces.size() ) - 1;
         m_frame->Bind( wxEVT_MENU, &PANEL_PLUGIN_REGISTRY::onToggleMenu, this, m_baseMenuId, lastId );
         m_frame->Bind( wxEVT_UPDATE_UI, &PANEL_PLUGIN_REGISTRY::onUpdateMenuUi, this, m_baseMenuId, lastId );
-        m_frame->ReCreateMenuBar();
         m_timer.Start( 16 );
     }
 }
@@ -463,6 +510,37 @@ void PANEL_PLUGIN_REGISTRY::onTimer( wxTimerEvent& )
         }
     }
     int actLayer = static_cast<int>( m_frame->GetActiveLayer() );
+    bool auiDirty = false;
     for( PANEL_PLUGIN_SURFACE* surf : m_surfaces )
+    {
+        if( m_auiMgr && surf->ConsumeToggleRequest() )
+        {
+            wxAuiPaneInfo& pane = m_auiMgr->GetPane( wxString::FromUTF8( surf->PaneName() ) );
+            if( pane.IsOk() )
+            {
+                bool show = !pane.IsShown();
+                pane.Show( show );
+                if( show )
+                    surf->EnsurePluginRunning();
+                auiDirty = true;
+            }
+        }
+        if( m_auiMgr )
+        {
+            int rw = surf->PollRequestedWidth();
+            if( rw > 0 )
+            {
+                wxAuiPaneInfo& pane = m_auiMgr->GetPane( wxString::FromUTF8( surf->PaneName() ) );
+                if( pane.IsOk() && pane.IsShown() )
+                {
+                    pane.BestSize( m_frame->FromDIP( wxSize( rw, 720 ) ) );
+                    pane.MinSize( m_frame->FromDIP( wxSize( std::min( rw, 324 ), 240 ) ) );
+                    auiDirty = true;
+                }
+            }
+        }
         surf->TickFromRegistry( wxMm, wyMm, zoomMpp, actLayer, cFlags );
+    }
+    if( auiDirty && m_auiMgr )
+        m_auiMgr->Update();
 }
