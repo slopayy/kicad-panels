@@ -50,19 +50,21 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: patch
-          path: ${{ runner.temp }}/artifact
+          path: artifact
       - uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/ccache
+          path: .ccache
           key: ccache-linux-${{ github.run_id }}
           restore-keys: ccache-linux-
       - run: |
-          export CCACHE_DIR="${{ runner.temp }}/ccache"
-          git init "${{ runner.temp }}/kicad"
-          git -C "${{ runner.temp }}/kicad" fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
-          git -C "${{ runner.temp }}/kicad" checkout FETCH_HEAD
-          git -C "${{ runner.temp }}/kicad" apply "${{ runner.temp }}/artifact/kicad-panels-nightly.patch"
-          cmake -S "${{ runner.temp }}/kicad" -B "${{ runner.temp }}/build" -G Ninja \
+          command -v glslangValidator >/dev/null 2>&1 || dnf install -y glslang spirv-tools vulkan-headers
+          command -v xz >/dev/null 2>&1 || dnf install -y xz
+          export CCACHE_DIR="$PWD/.ccache"
+          git init /tmp/kicad
+          git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
+          git -C /tmp/kicad checkout FETCH_HEAD
+          git -C /tmp/kicad apply "$PWD/artifact/kicad-panels-nightly.patch"
+          cmake -S /tmp/kicad -B /tmp/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -71,15 +73,15 @@ jobs:
             -DKICAD_INSTALL_DEMOS=OFF \
             -DKICAD_BUILD_NATIVE_MODEL_PREVIEW=OFF \
             -DKICAD_VERSION_EXTRA=panels
-          cmake --build "${{ runner.temp }}/build"
-          DESTDIR="${{ runner.temp }}/pkg" cmake --install "${{ runner.temp }}/build"
-          rm -rf "${{ runner.temp }}/build" "${{ runner.temp }}/kicad"
-          mkdir -p "${{ runner.temp }}/dist"
-          tar -C "${{ runner.temp }}/pkg/usr/local" -cJf "${{ runner.temp }}/dist/kicad-panels-nightly-linux-x86_64.tar.xz" .
+          cmake --build /tmp/build
+          DESTDIR=/tmp/pkg cmake --install /tmp/build
+          rm -rf /tmp/build /tmp/kicad
+          mkdir -p dist
+          tar -C /tmp/pkg/usr/local -cJf dist/kicad-panels-nightly-linux-x86_64.tar.xz .
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: "${{ runner.temp }}/dist/kicad-panels-nightly-linux-x86_64.tar.xz"
+          path: dist/kicad-panels-nightly-linux-x86_64.tar.xz
 
   macos:
     needs: patch
@@ -89,42 +91,42 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: patch
-          path: ${{ runner.temp }}/artifact
+          path: artifact
       - uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/ccache
+          path: .ccache
           key: ccache-macos-${{ github.run_id }}
           restore-keys: ccache-macos-
       - run: |
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_INSTALL_CLEANUP=1
           command -v cmake >/dev/null 2>&1 || brew install cmake
-          brew install ninja pkgconf ccache wxwidgets opencascade boost cairo pixman glm libgit2 sqlite freetype harfbuzz fontconfig libngspice protobuf abseil unixodbc zstd libpng jpeg-turbo glew
-          curl -fsSL https://github.com/nanomsg/nng/archive/refs/tags/v1.11.tar.gz | tar -xz -C "${{ runner.temp }}"
-          cmake -S "${{ runner.temp }}/nng-1.11" -B "${{ runner.temp }}/nng-build" -G Ninja \
+          brew install ninja pkgconf ccache wxwidgets opencascade boost cairo pixman glm libgit2 sqlite freetype harfbuzz fontconfig libngspice protobuf abseil unixodbc zstd libpng jpeg-turbo glew glslang spirv-tools spirv-cross
+          curl -fsSL https://github.com/nanomsg/nng/archive/refs/tags/v1.11.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/nng-1.11" -B "$RUNNER_TEMP/nng-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DNNG_TESTS=OFF \
             -DNNG_TOOLS=OFF \
-            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/deps" \
-            -DCMAKE_INSTALL_NAME_DIR="${{ runner.temp }}/deps/lib"
-          cmake --build "${{ runner.temp }}/nng-build"
-          cmake --install "${{ runner.temp }}/nng-build"
-          export CCACHE_DIR="${{ runner.temp }}/ccache"
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/deps" \
+            -DCMAKE_INSTALL_NAME_DIR="$RUNNER_TEMP/deps/lib"
+          cmake --build "$RUNNER_TEMP/nng-build"
+          cmake --install "$RUNNER_TEMP/nng-build"
+          export CCACHE_DIR="$PWD/.ccache"
           BREW_PREFIX="$(brew --prefix)"
-          git init "${{ runner.temp }}/kicad"
-          git -C "${{ runner.temp }}/kicad" fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
-          git -C "${{ runner.temp }}/kicad" checkout FETCH_HEAD
-          git -C "${{ runner.temp }}/kicad" apply "${{ runner.temp }}/artifact/kicad-panels-nightly.patch"
-          cmake -S "${{ runner.temp }}/kicad" -B "${{ runner.temp }}/build" -G Ninja \
+          git init "$RUNNER_TEMP/kicad"
+          git -C "$RUNNER_TEMP/kicad" fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
+          git -C "$RUNNER_TEMP/kicad" checkout FETCH_HEAD
+          git -C "$RUNNER_TEMP/kicad" apply "$PWD/artifact/kicad-panels-nightly.patch"
+          cmake -S "$RUNNER_TEMP/kicad" -B "$RUNNER_TEMP/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=/usr/bin/clang \
             -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
             -DCMAKE_OBJCXX_COMPILER=/usr/bin/clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/deps" \
-            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/pkg" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/deps" \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/pkg" \
             -DSQLite3_ROOT="$BREW_PREFIX/opt/sqlite" \
             -DOCC_INCLUDE_DIR="$BREW_PREFIX/opt/opencascade/include/opencascade" \
             -DOCC_LIBRARY_DIR="$BREW_PREFIX/opt/opencascade/lib" \
@@ -134,15 +136,15 @@ jobs:
             -DKICAD_INSTALL_DEMOS=OFF \
             -DKICAD_BUILD_NATIVE_MODEL_PREVIEW=OFF \
             -DKICAD_VERSION_EXTRA=panels
-          cmake --build "${{ runner.temp }}/build"
-          cmake --install "${{ runner.temp }}/build"
-          rm -rf "${{ runner.temp }}/build" "${{ runner.temp }}/kicad"
-          mkdir -p "${{ runner.temp }}/dist"
-          tar -C "${{ runner.temp }}/pkg" -cJf "${{ runner.temp }}/dist/kicad-panels-nightly-macos-arm64.tar.xz" KiCad.app
+          cmake --build "$RUNNER_TEMP/build"
+          cmake --install "$RUNNER_TEMP/build"
+          rm -rf "$RUNNER_TEMP/build" "$RUNNER_TEMP/kicad"
+          mkdir -p dist
+          tar -C "$RUNNER_TEMP/pkg" -cJf dist/kicad-panels-nightly-macos-arm64.tar.xz KiCad.app
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: "${{ runner.temp }}/dist/kicad-panels-nightly-macos-arm64.tar.xz"
+          path: dist/kicad-panels-nightly-macos-arm64.tar.xz
 
   freebsd:
     needs: patch
@@ -156,6 +158,11 @@ jobs:
         with:
           name: patch
           path: artifact
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-freebsd-${{ github.run_id }}
+          restore-keys: ccache-freebsd-
       - uses: vmactions/freebsd-vm@v1
         with:
           release: '14'
@@ -163,9 +170,10 @@ jobs:
           cpu: '4'
           envs: 'KICAD_COMMIT'
           prepare: |
-            pkg install -y git cmake-core ninja ccache pkgconf python3 gettext-tools glm wx32-gtk3 boost-libs opencascade ngspice_rework-shlib protobuf abseil nng1 sqlite3 unixODBC libgit2 curl cairo pixman harfbuzz fontconfig freetype2 png jpeg-turbo zstd poppler-glib libsecret wayland libspnav gtk3 mesa-libs libGLU libX11 libXext libICE
+            pkg install -y git cmake-core ninja ccache pkgconf python3 gettext-tools glm wx32-gtk3 boost-libs opencascade ngspice_rework-shlib protobuf abseil nng1 sqlite3 unixODBC libgit2 curl cairo pixman harfbuzz fontconfig freetype2 png jpeg-turbo zstd poppler-glib libsecret wayland libspnav gtk3 mesa-libs libGLU libX11 libXext libICE libxcb glslang spirv-tools vulkan-headers
             pkg clean -ay
           run: |
+            export CCACHE_DIR="$PWD/.ccache"
             git init /tmp/kicad
             git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git "$KICAD_COMMIT"
             git -C /tmp/kicad checkout FETCH_HEAD
@@ -177,11 +185,12 @@ jobs:
             done
             cmake -S /tmp/kicad -B /tmp/build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_FLAGS="-D_LIBCPP_ENABLE_EXPERIMENTAL -DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED" \
               -DCMAKE_INCLUDE_PATH="/tmp/kicad/include;/usr/local/include" \
               -DwxWidgets_CONFIG_EXECUTABLE=/usr/local/bin/wxgtk3u-3.2-config \
               -DOCC_INCLUDE_DIR=/usr/local/include/OpenCASCADE \
-              -DKICAD_USE_CMAKE_FINDPROTOBUF=ON \
               -DKICAD_BUILD_QA_TESTS=OFF \
               -DKICAD_INSTALL_DEMOS=OFF \
               -DKICAD_BUILD_NATIVE_MODEL_PREVIEW=OFF \
