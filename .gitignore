@@ -1,0 +1,10 @@
+/patch_kicad
+/test_kicad_panels
+/kicad/
+/kicad-*
+/build*
+/dist*
+/artifact*
+/.ccache*
+/*.patch
+.DS_Store
