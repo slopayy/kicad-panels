@@ -60,6 +60,7 @@ jobs:
           command -v glslangValidator >/dev/null 2>&1 || dnf install -y glslang spirv-tools vulkan-headers
           command -v xz >/dev/null 2>&1 || dnf install -y xz
           export CCACHE_DIR="$PWD/.ccache"
+          export CCACHE_SLOPPINESS=pch_defines,time_macros
           git init /tmp/kicad
           git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
           git -C /tmp/kicad checkout FETCH_HEAD
@@ -85,7 +86,7 @@ jobs:
 
   macos:
     needs: patch
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 180
     steps:
       - uses: actions/download-artifact@v4
@@ -113,6 +114,7 @@ jobs:
           cmake --build "$RUNNER_TEMP/nng-build"
           cmake --install "$RUNNER_TEMP/nng-build"
           export CCACHE_DIR="$PWD/.ccache"
+          export CCACHE_SLOPPINESS=pch_defines,time_macros
           BREW_PREFIX="$(brew --prefix)"
           git init "$RUNNER_TEMP/kicad"
           git -C "$RUNNER_TEMP/kicad" fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
@@ -174,6 +176,7 @@ jobs:
             pkg clean -ay
           run: |
             export CCACHE_DIR="$PWD/.ccache"
+            export CCACHE_SLOPPINESS=pch_defines,time_macros
             git init /tmp/kicad
             git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git "$KICAD_COMMIT"
             git -C /tmp/kicad checkout FETCH_HEAD
