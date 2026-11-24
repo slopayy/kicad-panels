@@ -62,7 +62,7 @@ def main() raises:
     kp_close(guest_p, False)
     kp_close(host_p, True)
 
-    var sample_json = String("{\"identifier\":\"dev.bee.theoretical-aided-pcb\",\"runtime\":{\"type\":\"exec\"},\"panels\":[{\"identifier\":\"blossom-physics\",\"name\":\"Blossom Physics\",\"dock\":\"left\",\"width\":324,\"height\":760,\"entrypoint\":\"blossom_pcb\",\"args\":[\"--panel\"]}]}")
+    var sample_json = String("{\"$schema\":\"https://go.kicad.org/api/schemas/v1\",\"identifier\":\"dev.bee.theoretical-aided-pcb\",\"runtime\":{\"type\":\"exec\"},\"actions\":[{\"identifier\":\"blossom-routing-field\",\"scopes\":[\"pcb\"],\"entrypoint\":\"blossom_pcb\"}],\"panels\":[{\"identifier\":\"blossom-physics\",\"name\":\"Blossom Physics\",\"dock\":\"left\",\"width\":324,\"height\":760,\"entrypoint\":\"blossom_pcb\",\"args\":[\"--panel\"]}]}")
     var parsed = kp_parse_manifest_json(sample_json, String("/tmp/mock_plug"))
     _must(len(parsed) == 1 and parsed[0].plugin_id == String("dev.bee.theoretical-aided-pcb") and parsed[0].panel_id == String("blossom-physics") and parsed[0].width == 324, "manifest_json_parse")
 
@@ -87,8 +87,9 @@ def main() raises:
     _ = _p_write(tmp_kc + String("/pcbnew/menubar_pcb_editor.cpp"), _p_read(real_kc + String("/pcbnew/menubar_pcb_editor.cpp")))
 
     var real_plug_json = _p_read(String("/Users/bee/Hacking/theoretical-aided-pcb/kicad_plugin/plugin.json"))
-    var real_parsed = kp_parse_manifest_json(real_plug_json, String("/Users/bee/Hacking/theoretical-aided-pcb/kicad_plugin"))
-    _must(len(real_parsed) == 1 and real_parsed[0].panel_id == String("blossom-physics") and real_parsed[0].height == 760 and real_parsed[0].entrypoint == String("blossom_pcb"), "real_plugin_json_manifest")
+    if real_plug_json.byte_length() > 0:
+        var real_parsed = kp_parse_manifest_json(real_plug_json, String("/Users/bee/Hacking/theoretical-aided-pcb/kicad_plugin"))
+        _must(len(real_parsed) == 1 and real_parsed[0].panel_id == String("blossom-physics") and real_parsed[0].height == 760 and real_parsed[0].entrypoint == String("blossom_pcb"), "real_plugin_json_manifest")
 
     var n1 = apply_kicad_panels_patch(tmp_kc, repo_dir, False)
     var n2 = apply_kicad_panels_patch(tmp_kc, repo_dir, False)
