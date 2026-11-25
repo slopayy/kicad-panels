@@ -1,14 +1,24 @@
 from std.atomic import Atomic
 from std.ffi import external_call
-from std.math import clamp
+from std.math import abs, clamp, sqrt
 from std.memory import Pointer
 from std.sys.info import CompilationTarget
 
 comptime KP_MAGIC = UInt32(0x4B504E4C)
-comptime KP_VERSION = UInt32(1)
-comptime KP_FB_OFF = 16384
+comptime KP_VERSION = UInt32(2)
+comptime KP_RING_I32_BASE = 512
+comptime KP_TEXT_COMMIT_OFF = 6144
+comptime KP_WIDGET_OFF = 16384
+comptime KP_WIDGET_STRIDE = 2048
+comptime KP_DOCK_SLOTS = 48
+comptime KP_DIALOG_SLOTS = 48
+comptime KP_CANVAS0_OFF = 262144
+comptime KP_CANVAS1_OFF = 1490944
+comptime KP_CANVAS2_OFF = 2514944
+comptime KP_OVERLAY_OFF = 4153344
+comptime KP_FB_OFF = 4153344
 comptime KP_MAX_DIM = 1024
-comptime KP_SHM_BYTES = 4210688
+comptime KP_SHM_BYTES = 8347648
 comptime KP_RING_MASK = UInt32(255)
 
 comptime KP_EV_MOVE = 1
@@ -17,6 +27,21 @@ comptime KP_EV_UP = 3
 comptime KP_EV_WHEEL = 4
 comptime KP_EV_KEY = 5
 comptime KP_EV_FOCUS = 6
+comptime KP_EV_WIDGET_CLICK = 10
+comptime KP_EV_WIDGET_SELECT = 11
+comptime KP_EV_WIDGET_CHECK = 12
+comptime KP_EV_WIDGET_TEXT = 13
+comptime KP_EV_CANVAS_MOUSE = 14
+comptime KP_EV_DIALOG_CLOSED = 15
+
+comptime KP_W_HEADER = 1
+comptime KP_W_BUTTON = 2
+comptime KP_W_CHOICE = 3
+comptime KP_W_CHECKBOX = 4
+comptime KP_W_TEXTBOX = 5
+comptime KP_W_KV_ROW = 6
+comptime KP_W_SECTION = 7
+comptime KP_W_CANVAS = 8
 
 @fieldwise_init
 struct KpPanelManifest(Copyable, Movable):
@@ -41,6 +66,23 @@ struct KpCanvasState(Copyable, Movable):
     var flipped_x: Bool
 
 @fieldwise_init
+struct KpWidgetEvent(Copyable, Movable):
+    var id: Int
+    var kind: Int
+    var sel_idx: Int
+    var text: String
+
+@fieldwise_init
+struct KpCanvasMouse(Copyable, Movable):
+    var mx: Int
+    var my: Int
+    var mouse_down: Bool
+    var clicked: Bool
+    var released: Bool
+    var wheel_dy: Int
+    var inside: Bool
+
+@fieldwise_init
 struct KpInputState(Copyable, Movable):
     var mx: Int
     var my: Int
@@ -51,7 +93,12 @@ struct KpInputState(Copyable, Movable):
     var focused: Bool
     var resized: Bool
     var quit_requested: Bool
+    var dialog_closed: Bool
     var typed_keys: List[Int]
+    var widget_events: List[KpWidgetEvent]
+    var canvas0: KpCanvasMouse
+    var canvas1: KpCanvasMouse
+    var canvas2: KpCanvasMouse
 
 @fieldwise_init
 struct KpPanel(Copyable, Movable):
@@ -67,6 +114,18 @@ struct KpPanel(Copyable, Movable):
     var focused: Bool
     var last_host_seq: UInt32
     var canvas: KpCanvasState
+    var dock_build_idx: Int
+    var dlg_build_idx: Int
+    var dock_dirty: Bool
+    var dlg_dirty: Bool
+    var c_mx: SIMD[DType.int32, 4]
+    var c_my: SIMD[DType.int32, 4]
+    var c_down: SIMD[DType.int32, 4]
+    var c_in: SIMD[DType.int32, 4]
+    var pending_events: List[KpWidgetEvent]
+
+def kp_rgba(r: Int, g: Int, b: Int, a: Int = 255) -> UInt32:
+    return UInt32(clamp(r, 0, 255)) | (UInt32(clamp(g, 0, 255)) << UInt32(8)) | (UInt32(clamp(b, 0, 255)) << UInt32(16)) | (UInt32(clamp(a, 0, 255)) << UInt32(24))
 
 def kp_sanitize_id(raw: String) -> String:
     var out = String("")
@@ -96,6 +155,34 @@ def _kp_read_env(name: String) -> String:
         k += 1
     return String(from_utf8_lossy=buf[0:len(buf)])
 
+def _kp_read_cstr_at(addr: Int, max_len: Int) -> String:
+    if addr == 0 or max_len <= 0:
+        return String("")
+    var u8 = Pointer[mut=False, UInt8, MutAnyOrigin](unsafe_from_address=addr)
+    var buf = List[UInt8]()
+    var k = 0
+    while k < max_len and u8[unsafe_offset=k] != UInt8(0):
+        buf.append(u8[unsafe_offset=k])
+        k += 1
+    return String(from_utf8_lossy=buf[0:len(buf)])
+
+def _kp_write_cstr_diff(addr: Int, max_cap: Int, s: String) -> Bool:
+    if addr == 0 or max_cap <= 0:
+        return False
+    var u8 = Pointer[mut=True, UInt8, MutAnyOrigin](unsafe_from_address=addr)
+    var sb = s.as_bytes()
+    var n = min(len(sb), max_cap - 1)
+    var changed = False
+    for i in range(n):
+        var b = sb[i]
+        if u8[unsafe_offset=i] != b:
+            u8[unsafe_offset=i] = b
+            changed = True
+    if u8[unsafe_offset=n] != UInt8(0):
+        u8[unsafe_offset=n] = UInt8(0)
+        changed = True
+    return changed
+
 def kp_open(shm_spec: String = String(""), create: Bool = True, init_w: Int = 324, init_h: Int = 760) -> KpPanel:
     var spec = shm_spec if shm_spec.byte_length() > 0 else _kp_read_env(String("KICAD_PANEL_SHM"))
     if spec.byte_length() == 0:
@@ -107,22 +194,30 @@ def kp_open(shm_spec: String = String(""), create: Bool = True, init_w: Int = 32
     var fd = external_call["open", Int32](pc.unsafe_ptr(), flags)
     _ = pc
     var empty_cv = KpCanvasState(False, Float32(0.0), Float32(0.0), Float32(0.1), 0, False, False, False)
+    var empty_ev = List[KpWidgetEvent]()
+    var neg4 = SIMD[DType.int32, 4](-1, -1, -1, -1)
+    var zero4 = SIMD[DType.int32, 4](0, 0, 0, 0)
     if fd < Int32(0):
-        return KpPanel(0, 0, path, False, init_w, init_h, -1, -1, False, False, UInt32(0), empty_cv^)
-    if create:
+        return KpPanel(0, 0, path, False, init_w, init_h, -1, -1, False, False, UInt32(0), empty_cv^, 0, 0, False, False, neg4, neg4, zero4, zero4, empty_ev^)
+    var st_ok = create
+    if not create:
+        var cur_sz = external_call["lseek", Int64](fd, Int64(0), Int32(2))
+        if cur_sz < Int64(KP_SHM_BYTES):
+            st_ok = True
+    if st_ok:
         _ = external_call["fchmod", Int32](fd, UInt16(384))
         _ = external_call["ftruncate", Int32](fd, Int64(KP_SHM_BYTES))
     var addr = external_call["mmap", Int](Int(0), KP_SHM_BYTES, Int32(3), Int32(1), fd, Int64(0))
     _ = external_call["close", Int32](fd)
     if addr == -1 or addr == 0:
-        return KpPanel(0, 0, path, False, init_w, init_h, -1, -1, False, False, UInt32(0), empty_cv^)
+        return KpPanel(0, 0, path, False, init_w, init_h, -1, -1, False, False, UInt32(0), empty_cv^, 0, 0, False, False, neg4, neg4, zero4, zero4, empty_ev^)
     var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=addr)
     var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=addr)
     var f32 = Pointer[mut=True, Float32, MutAnyOrigin](unsafe_from_address=addr)
     var w = clamp(init_w, 64, KP_MAX_DIM)
     var h = clamp(init_h, 64, KP_MAX_DIM)
-    if Atomic.load(u32.unsafe_offset(0)) != KP_MAGIC:
-        _ = external_call["memset", Int](addr, Int32(0), KP_FB_OFF)
+    if Atomic.load(u32.unsafe_offset(0)) != KP_MAGIC or u32[unsafe_offset=1] != KP_VERSION:
+        _ = external_call["memset", Int](addr, Int32(0), KP_CANVAS0_OFF)
         i32[unsafe_offset=4] = Int32(w)
         i32[unsafe_offset=5] = Int32(h)
         i32[unsafe_offset=6] = Int32(w)
@@ -133,9 +228,9 @@ def kp_open(shm_spec: String = String(""), create: Bool = True, init_w: Int = 32
         Atomic.store(u32.unsafe_offset(0), KP_MAGIC)
     else:
         w = clamp(Int(i32[unsafe_offset=4]), 64, KP_MAX_DIM)
-        h = clamp(Int(Int(i32[unsafe_offset=5])), 64, KP_MAX_DIM)
+        h = clamp(Int(i32[unsafe_offset=5]), 64, KP_MAX_DIM)
         i32[unsafe_offset=7] = i32[unsafe_offset=7] | Int32(4)
-    return KpPanel(addr, KP_SHM_BYTES, path, create, w, h, -1, -1, False, False, Atomic.load(u32.unsafe_offset(2)), empty_cv^)
+    return KpPanel(addr, KP_SHM_BYTES, path, create, w, h, -1, -1, False, False, Atomic.load(u32.unsafe_offset(2)), empty_cv^, 0, 0, False, False, neg4, neg4, zero4, zero4, empty_ev^)
 
 def kp_close(mut p: KpPanel, unlink_file: Bool = False):
     if p.shm_addr != 0 and p.shm_bytes > 0:
@@ -148,8 +243,78 @@ def kp_close(mut p: KpPanel, unlink_file: Bool = False):
         _ = external_call["unlink", Int32](pc.unsafe_ptr())
         _ = pc
 
+def kp_host_attached(p: KpPanel) -> Bool:
+    if p.shm_addr == 0:
+        return False
+    var i32 = Pointer[mut=False, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    return (i32[unsafe_offset=7] & Int32(2)) != Int32(0)
+
+def kp_board_path(p: KpPanel) -> String:
+    if p.shm_addr == 0:
+        return String("")
+    return _kp_read_cstr_at(p.shm_addr + 512, 1023)
+
+def kp_host_set_board_path(p: KpPanel, path: String):
+    if p.shm_addr == 0:
+        return
+    _ = _kp_write_cstr_diff(p.shm_addr + 512, 1024, path)
+
 def kp_fb_ptr(p: KpPanel) -> Pointer[mut=True, UInt8, MutAnyOrigin]:
     return Pointer[mut=True, UInt8, MutAnyOrigin](unsafe_from_address=p.shm_addr + KP_FB_OFF)
+
+def kp_canvas_ptr(p: KpPanel, canvas_idx: Int) -> Pointer[mut=True, UInt8, MutAnyOrigin]:
+    var off = KP_CANVAS0_OFF
+    if canvas_idx == 1:
+        off = KP_CANVAS1_OFF
+    elif canvas_idx == 2:
+        off = KP_CANVAS2_OFF
+    return Pointer[mut=True, UInt8, MutAnyOrigin](unsafe_from_address=p.shm_addr + off)
+
+def kp_present_canvas(p: KpPanel, canvas_idx: Int, w: Int, h: Int):
+    if p.shm_addr == 0 or canvas_idx < 0 or canvas_idx > 2:
+        return
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var max_h = 480 if canvas_idx == 0 else (400 if canvas_idx == 1 else 640)
+    var base = 20 + canvas_idx * 3
+    i32[unsafe_offset=base + 1] = Int32(clamp(w, 1, 640))
+    i32[unsafe_offset=base + 2] = Int32(clamp(h, 1, max_h))
+    Atomic.store(u32.unsafe_offset(base), Atomic.load(u32.unsafe_offset(base)) + UInt32(1))
+
+def kp_set_board_overlay[O: Origin](
+    p: KpPanel, src_ptr: Pointer[UInt8, O], w: Int, h: Int,
+    cx_iu: Int64, cy_iu: Int64, scale_ratio: Float64,
+    is_bgra: Bool = True, pcb_layer: Int = 55,
+):
+    if p.shm_addr == 0:
+        return
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var i64 = Pointer[mut=True, Int64, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var f64 = Pointer[mut=True, Float64, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    if w <= 0 or h <= 0:
+        i32[unsafe_offset=30] = Int32(0)
+        i32[unsafe_offset=31] = Int32(0)
+        Atomic.store(u32.unsafe_offset(29), Atomic.load(u32.unsafe_offset(29)) + UInt32(1))
+        return
+    var cw = clamp(w, 1, KP_MAX_DIM)
+    var ch = clamp(h, 1, KP_MAX_DIM)
+    var dst = p.shm_addr + KP_OVERLAY_OFF
+    var s_addr = Int(src_ptr)
+    if s_addr != 0 and s_addr != dst:
+        if cw == w:
+            _ = external_call["memcpy", Int](dst, s_addr, cw * ch * 4)
+        else:
+            for ry in range(ch):
+                _ = external_call["memcpy", Int](dst + ry * cw * 4, s_addr + ry * w * 4, cw * 4)
+    i32[unsafe_offset=30] = Int32(cw)
+    i32[unsafe_offset=31] = Int32(ch)
+    i32[unsafe_offset=32] = Int32(pcb_layer)
+    i32[unsafe_offset=33] = Int32(0 if is_bgra else 1)
+    i64[unsafe_offset=18] = cx_iu
+    i64[unsafe_offset=19] = cy_iu
+    f64[unsafe_offset=20] = scale_ratio
+    Atomic.store(u32.unsafe_offset(29), Atomic.load(u32.unsafe_offset(29)) + UInt32(1))
 
 def kp_request_width(p: KpPanel, req_w: Int):
     if p.shm_addr == 0:
@@ -164,7 +329,7 @@ def kp_request_host_toggle(shm_spec: String = String("dev.bee.theoretical-aided-
     _ = pc
     if fd < Int32(0):
         return False
-    var addr = external_call["mmap", Int](Int(0), KP_FB_OFF, Int32(3), Int32(1), fd, Int64(0))
+    var addr = external_call["mmap", Int](Int(0), 4096, Int32(3), Int32(1), fd, Int64(0))
     _ = external_call["close", Int32](fd)
     if addr == -1 or addr == 0:
         return False
@@ -174,7 +339,7 @@ def kp_request_host_toggle(shm_spec: String = String("dev.bee.theoretical-aided-
     if Atomic.load(u32.unsafe_offset(0)) == KP_MAGIC and (i32[unsafe_offset=7] & Int32(2)) != Int32(0):
         i32[unsafe_offset=7] = i32[unsafe_offset=7] | Int32(32)
         ok = True
-    _ = external_call["munmap", Int32](addr, KP_FB_OFF)
+    _ = external_call["munmap", Int32](addr, 4096)
     return ok
 
 def kp_set_key_focus(p: KpPanel, want_key: Bool):
@@ -192,10 +357,185 @@ def kp_present(mut p: KpPanel):
     var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     Atomic.store(u32.unsafe_offset(3), Atomic.load(u32.unsafe_offset(3)) + UInt32(1))
 
+def _kp_write_widget_slot(
+    mut p: KpPanel, in_dialog: Bool, id: Int, kind: Int, row_group: Int,
+    flags: Int, sel_idx: Int, min_h: Int, aux_color: UInt32,
+    label: String, value: String,
+):
+    if p.shm_addr == 0:
+        return
+    var idx = p.dlg_build_idx if in_dialog else p.dock_build_idx
+    var limit = KP_DIALOG_SLOTS if in_dialog else KP_DOCK_SLOTS
+    if idx >= limit:
+        return
+    var slot_idx = (KP_DOCK_SLOTS + idx) if in_dialog else idx
+    if in_dialog:
+        p.dlg_build_idx += 1
+    else:
+        p.dock_build_idx += 1
+    var base = p.shm_addr + KP_WIDGET_OFF + slot_idx * KP_WIDGET_STRIDE
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=base)
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=base)
+    var chg = False
+    if i32[unsafe_offset=0] != Int32(id):
+        i32[unsafe_offset=0] = Int32(id)
+        chg = True
+    if i32[unsafe_offset=1] != Int32(kind):
+        i32[unsafe_offset=1] = Int32(kind)
+        chg = True
+    if i32[unsafe_offset=2] != Int32(row_group):
+        i32[unsafe_offset=2] = Int32(row_group)
+        chg = True
+    if i32[unsafe_offset=3] != Int32(flags):
+        i32[unsafe_offset=3] = Int32(flags)
+        chg = True
+    if i32[unsafe_offset=4] != Int32(sel_idx):
+        i32[unsafe_offset=4] = Int32(sel_idx)
+        chg = True
+    if i32[unsafe_offset=5] != Int32(min_h):
+        i32[unsafe_offset=5] = Int32(min_h)
+        chg = True
+    if u32[unsafe_offset=6] != aux_color:
+        u32[unsafe_offset=6] = aux_color
+        chg = True
+    if _kp_write_cstr_diff(base + 32, 96, label):
+        chg = True
+    if _kp_write_cstr_diff(base + 128, 1920, value):
+        chg = True
+    if chg:
+        if in_dialog:
+            p.dlg_dirty = True
+        else:
+            p.dock_dirty = True
+
+def kp_begin_widgets(mut p: KpPanel):
+    p.dock_build_idx = 0
+    p.dock_dirty = False
+
+def kp_end_widgets(mut p: KpPanel):
+    if p.shm_addr == 0:
+        return
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    if i32[unsafe_offset=18] != Int32(p.dock_build_idx):
+        i32[unsafe_offset=18] = Int32(p.dock_build_idx)
+        p.dock_dirty = True
+    if p.dock_dirty:
+        Atomic.store(u32.unsafe_offset(14), Atomic.load(u32.unsafe_offset(14)) + UInt32(1))
+        Atomic.store(u32.unsafe_offset(3), Atomic.load(u32.unsafe_offset(3)) + UInt32(1))
+
+def kp_begin_dialog(mut p: KpPanel, title: String):
+    p.dlg_build_idx = 0
+    p.dlg_dirty = False
+    if p.shm_addr != 0:
+        if _kp_write_cstr_diff(p.shm_addr + 256, 128, title):
+            p.dlg_dirty = True
+
+def kp_end_dialog(mut p: KpPanel):
+    if p.shm_addr == 0:
+        return
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var was_open = (i32[unsafe_offset=7] & Int32(64)) != Int32(0)
+    i32[unsafe_offset=7] = i32[unsafe_offset=7] | Int32(64)
+    if not was_open:
+        p.dlg_dirty = True
+    if i32[unsafe_offset=19] != Int32(p.dlg_build_idx):
+        i32[unsafe_offset=19] = Int32(p.dlg_build_idx)
+        p.dlg_dirty = True
+    if p.dlg_dirty:
+        Atomic.store(u32.unsafe_offset(15), Atomic.load(u32.unsafe_offset(15)) + UInt32(1))
+        Atomic.store(u32.unsafe_offset(3), Atomic.load(u32.unsafe_offset(3)) + UInt32(1))
+
+def kp_close_dialog(mut p: KpPanel):
+    if p.shm_addr == 0:
+        return
+    var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    if (i32[unsafe_offset=7] & Int32(64)) != Int32(0) or i32[unsafe_offset=19] != Int32(0):
+        i32[unsafe_offset=7] = i32[unsafe_offset=7] & (~Int32(64))
+        i32[unsafe_offset=19] = Int32(0)
+        Atomic.store(u32.unsafe_offset(15), Atomic.load(u32.unsafe_offset(15)) + UInt32(1))
+        Atomic.store(u32.unsafe_offset(3), Atomic.load(u32.unsafe_offset(3)) + UInt32(1))
+
+def kp_header(mut p: KpPanel, id: Int, title: String, badge: String, badge_rgba: UInt32, in_dialog: Bool = False) -> Bool:
+    var clicked = False
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_CLICK:
+            clicked = True
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_HEADER, 0, 3, 0, 28, badge_rgba, title, badge)
+    return clicked
+
+def kp_section(mut p: KpPanel, id: Int, title: String, action_lbl: String = String(""), in_dialog: Bool = False) -> Bool:
+    var clicked = False
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_CLICK:
+            clicked = True
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_SECTION, 0, 3, 0, 24, UInt32(0), title, action_lbl)
+    return clicked
+
+def kp_kv_row(mut p: KpPanel, id: Int, left_txt: String, right_txt: String, right_rgba: UInt32 = UInt32(0), row_group: Int = 0, in_dialog: Bool = False):
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_KV_ROW, row_group, 3, 0, 20, right_rgba, left_txt, right_txt)
+
+def kp_button(mut p: KpPanel, id: Int, label: String, accent_rgba: UInt32 = UInt32(0), row_group: Int = 0, in_dialog: Bool = False) -> Bool:
+    var clicked = False
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_CLICK:
+            clicked = True
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_BUTTON, row_group, 3, 0, 26, accent_rgba, label, String(""))
+    return clicked
+
+def kp_choice(mut p: KpPanel, id: Int, label: String, opts: List[String], mut sel_idx: Int, row_group: Int = 0, in_dialog: Bool = False) -> Bool:
+    var changed = False
+    var n = len(opts)
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_SELECT:
+            var ns = clamp(p.pending_events[i].sel_idx, 0, max(0, n - 1))
+            if ns != sel_idx:
+                sel_idx = ns
+                changed = True
+    var joined = String("")
+    for k in range(n):
+        if k > 0:
+            joined += String("\n")
+        joined += opts[k]
+    var cur = clamp(sel_idx, 0, max(0, n - 1))
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_CHOICE, row_group, 3, cur, 26, UInt32(0), label, joined)
+    return changed
+
+def kp_checkbox(mut p: KpPanel, id: Int, label: String, mut checked: Bool, row_group: Int = 0, in_dialog: Bool = False) -> Bool:
+    var changed = False
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_CHECK:
+            var nc = p.pending_events[i].sel_idx != 0
+            if nc != checked:
+                checked = nc
+                changed = True
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_CHECKBOX, row_group, 3, 1 if checked else 0, 24, UInt32(0), label, String(""))
+    return changed
+
+def kp_textbox(mut p: KpPanel, id: Int, label: String, mut val_txt: String, row_group: Int = 0, in_dialog: Bool = False) -> Bool:
+    var changed = False
+    for i in range(len(p.pending_events)):
+        if p.pending_events[i].id == id and p.pending_events[i].kind == KP_EV_WIDGET_TEXT:
+            val_txt = p.pending_events[i].text
+            changed = True
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_TEXTBOX, row_group, 3, 0, 26, UInt32(0), label, val_txt)
+    return changed
+
+def kp_canvas(mut p: KpPanel, id: Int, canvas_idx: Int, min_h: Int, in_dialog: Bool = False):
+    _kp_write_widget_slot(p, in_dialog, id, KP_W_CANVAS, 0, 3, clamp(canvas_idx, 0, 2), max(48, min_h), UInt32(0), String(""), String(""))
+
 def kp_poll(mut p: KpPanel) -> KpInputState:
     var keys = List[Int]()
+    var wevs = List[KpWidgetEvent]()
+    p.pending_events.clear()
+    var c_clk = SIMD[DType.int32, 4](0, 0, 0, 0)
+    var c_rel = SIMD[DType.int32, 4](0, 0, 0, 0)
+    var c_whl = SIMD[DType.int32, 4](0, 0, 0, 0)
     if p.shm_addr == 0:
-        return KpInputState(p.mx, p.my, p.mouse_down, False, False, 0, p.focused, False, True, keys^)
+        var dc = KpCanvasMouse(-1, -1, False, False, False, 0, False)
+        return KpInputState(p.mx, p.my, p.mouse_down, False, False, 0, p.focused, False, True, False, keys^, wevs^, dc.copy(), dc.copy(), dc^)
     var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     var i32 = Pointer[mut=False, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     var f32 = Pointer[mut=False, Float32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
@@ -222,11 +562,12 @@ def kp_poll(mut p: KpPanel) -> KpInputState:
     var clicked = False
     var released = False
     var wheel_dy = 0
+    var dlg_closed = False
     var w_idx = Atomic.load(u32.unsafe_offset(16))
     var r_idx = Atomic.load(u32.unsafe_offset(17))
     var guard = 0
     while r_idx != w_idx and guard < 256:
-        var base = 64 + Int(r_idx & KP_RING_MASK) * 4
+        var base = KP_RING_I32_BASE + Int(r_idx & KP_RING_MASK) * 4
         var kind = Int(i32[unsafe_offset=base + 0])
         var vx = Int(i32[unsafe_offset=base + 1])
         var vy = Int(i32[unsafe_offset=base + 2])
@@ -255,10 +596,51 @@ def kp_poll(mut p: KpPanel) -> KpInputState:
                 keys.append(vx)
         elif kind == KP_EV_FOCUS:
             p.focused = vx != 0
+        elif kind == KP_EV_WIDGET_CLICK or kind == KP_EV_WIDGET_SELECT or kind == KP_EV_WIDGET_CHECK:
+            var ev = KpWidgetEvent(vx, kind, vy, String(""))
+            p.pending_events.append(ev.copy())
+            wevs.append(ev^)
+        elif kind == KP_EV_WIDGET_TEXT:
+            var tslot = clamp(vy, 0, 95)
+            var tstr = _kp_read_cstr_at(p.shm_addr + KP_TEXT_COMMIT_OFF + tslot * 64, 63)
+            var ev_t = KpWidgetEvent(vx, kind, vy, tstr)
+            p.pending_events.append(ev_t.copy())
+            wevs.append(ev_t^)
+        elif kind == KP_EV_CANVAS_MOUSE:
+            var ci = clamp(vx, 0, 2)
+            var cmx = Int(Int16(vy & 0xFFFF))
+            var cmy = Int(Int16((vy >> 16) & 0xFFFF))
+            var sub = aux & 0xFF
+            var whl = aux >> 8
+            if sub == 5:
+                p.c_in[ci] = Int32(0)
+                p.c_mx[ci] = Int32(-1)
+                p.c_my[ci] = Int32(-1)
+            else:
+                p.c_in[ci] = Int32(1)
+                p.c_mx[ci] = Int32(cmx)
+                p.c_my[ci] = Int32(cmy)
+                if sub == 2:
+                    if p.c_down[ci] == Int32(0):
+                        c_clk[ci] = Int32(1)
+                    p.c_down[ci] = Int32(1)
+                elif sub == 3:
+                    if p.c_down[ci] != Int32(0):
+                        c_rel[ci] = Int32(1)
+                    p.c_down[ci] = Int32(0)
+                elif sub == 4:
+                    c_whl[ci] += Int32(whl)
+        elif kind == KP_EV_DIALOG_CLOSED:
+            dlg_closed = True
+            var mut_i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+            mut_i32[unsafe_offset=7] = mut_i32[unsafe_offset=7] & (~Int32(64))
         r_idx += UInt32(1)
         guard += 1
     Atomic.store(u32.unsafe_offset(17), r_idx)
-    return KpInputState(p.mx, p.my, p.mouse_down, clicked, released, wheel_dy, p.focused, resized, quit_req, keys^)
+    var cm0 = KpCanvasMouse(Int(p.c_mx[0]), Int(p.c_my[0]), p.c_down[0] != Int32(0), c_clk[0] != Int32(0), c_rel[0] != Int32(0), Int(c_whl[0]), p.c_in[0] != Int32(0))
+    var cm1 = KpCanvasMouse(Int(p.c_mx[1]), Int(p.c_my[1]), p.c_down[1] != Int32(0), c_clk[1] != Int32(0), c_rel[1] != Int32(0), Int(c_whl[1]), p.c_in[1] != Int32(0))
+    var cm2 = KpCanvasMouse(Int(p.c_mx[2]), Int(p.c_my[2]), p.c_down[2] != Int32(0), c_clk[2] != Int32(0), c_rel[2] != Int32(0), Int(c_whl[2]), p.c_in[2] != Int32(0))
+    return KpInputState(p.mx, p.my, p.mouse_down, clicked, released, wheel_dy, p.focused, resized, quit_req, dlg_closed, keys^, wevs^, cm0^, cm1^, cm2^)
 
 def kp_host_set_size(p: KpPanel, w: Int, h: Int, visible: Bool = True):
     if p.shm_addr == 0:
@@ -298,18 +680,230 @@ def kp_host_push_event(p: KpPanel, kind: Int, x: Int, y: Int, aux: Int = 0):
     var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     var i32 = Pointer[mut=True, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     var w_idx = Atomic.load(u32.unsafe_offset(16))
-    var base = 64 + Int(w_idx & KP_RING_MASK) * 4
+    var base = KP_RING_I32_BASE + Int(w_idx & KP_RING_MASK) * 4
     i32[unsafe_offset=base + 0] = Int32(kind)
     i32[unsafe_offset=base + 1] = Int32(x)
     i32[unsafe_offset=base + 2] = Int32(y)
     i32[unsafe_offset=base + 3] = Int32(aux)
     Atomic.store(u32.unsafe_offset(16), w_idx + UInt32(1))
 
+def kp_host_commit_text(p: KpPanel, widget_id: Int, slot_idx: Int, text: String):
+    if p.shm_addr == 0:
+        return
+    var ts = clamp(slot_idx, 0, 95)
+    _ = _kp_write_cstr_diff(p.shm_addr + KP_TEXT_COMMIT_OFF + ts * 64, 64, text)
+    kp_host_push_event(p, KP_EV_WIDGET_TEXT, widget_id, ts, 1)
+
+def kp_host_push_canvas_mouse(p: KpPanel, canvas_idx: Int, sub_ev: Int, lx: Int, ly: Int, wheel: Int = 0):
+    var packed_xy = (lx & 0xFFFF) | ((ly & 0xFFFF) << 16)
+    var packed_aux = (sub_ev & 0xFF) | (wheel << 8)
+    kp_host_push_event(p, KP_EV_CANVAS_MOUSE, canvas_idx, packed_xy, packed_aux)
+
 def kp_host_frame_seq(p: KpPanel) -> UInt32:
     if p.shm_addr == 0:
         return UInt32(0)
     var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
     return Atomic.load(u32.unsafe_offset(3))
+
+def kp_host_overlay_seq(p: KpPanel) -> UInt32:
+    if p.shm_addr == 0:
+        return UInt32(0)
+    var u32 = Pointer[mut=True, UInt32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    return Atomic.load(u32.unsafe_offset(29))
+
+def kp_host_widget_count(p: KpPanel, in_dialog: Bool = False) -> Int:
+    if p.shm_addr == 0:
+        return 0
+    var i32 = Pointer[mut=False, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    return Int(i32[unsafe_offset=19 if in_dialog else 18])
+
+def kp_host_dialog_open(p: KpPanel) -> Bool:
+    if p.shm_addr == 0:
+        return False
+    var i32 = Pointer[mut=False, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr)
+    return (i32[unsafe_offset=7] & Int32(64)) != Int32(0)
+
+def kp_host_widget_label(p: KpPanel, idx: Int, in_dialog: Bool = False) -> String:
+    if p.shm_addr == 0 or idx < 0 or idx >= 48:
+        return String("")
+    var slot = (KP_DOCK_SLOTS + idx) if in_dialog else idx
+    return _kp_read_cstr_at(p.shm_addr + KP_WIDGET_OFF + slot * KP_WIDGET_STRIDE + 32, 95)
+
+def kp_host_widget_value(p: KpPanel, idx: Int, in_dialog: Bool = False) -> String:
+    if p.shm_addr == 0 or idx < 0 or idx >= 48:
+        return String("")
+    var slot = (KP_DOCK_SLOTS + idx) if in_dialog else idx
+    return _kp_read_cstr_at(p.shm_addr + KP_WIDGET_OFF + slot * KP_WIDGET_STRIDE + 128, 1919)
+
+def kp_host_widget_sel(p: KpPanel, idx: Int, in_dialog: Bool = False) -> Int:
+    if p.shm_addr == 0 or idx < 0 or idx >= 48:
+        return 0
+    var slot = (KP_DOCK_SLOTS + idx) if in_dialog else idx
+    var i32 = Pointer[mut=False, Int32, MutAnyOrigin](unsafe_from_address=p.shm_addr + KP_WIDGET_OFF + slot * KP_WIDGET_STRIDE)
+    return Int(i32[unsafe_offset=4])
+
+def kp_clear_rgba[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, c: UInt32):
+    var r = UInt8(c & UInt32(255))
+    var g = UInt8((c >> UInt32(8)) & UInt32(255))
+    var b = UInt8((c >> UInt32(16)) & UInt32(255))
+    var a = UInt8((c >> UInt32(24)) & UInt32(255))
+    var n = bw * bh
+    for i in range(n):
+        var o = i * 4
+        bmp[unsafe_offset=o + 0] = r
+        bmp[unsafe_offset=o + 1] = g
+        bmp[unsafe_offset=o + 2] = b
+        bmp[unsafe_offset=o + 3] = a
+
+def kp_fill_rect[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, x: Int, y: Int, rw: Int, rh: Int, c: UInt32, corner_cut: Int = 0):
+    if rw <= 0 or rh <= 0:
+        return
+    var r = UInt8(c & UInt32(255))
+    var g = UInt8((c >> UInt32(8)) & UInt32(255))
+    var b = UInt8((c >> UInt32(16)) & UInt32(255))
+    var a = UInt8((c >> UInt32(24)) & UInt32(255))
+    for py in range(max(0, y), min(bh, y + rh)):
+        var dy_c = min(py - y, rh - 1 - (py - y))
+        for px in range(max(0, x), min(bw, x + rw)):
+            if corner_cut <= 0 or min(px - x, rw - 1 - (px - x)) + dy_c >= corner_cut:
+                var di = (py * bw + px) * 4
+                bmp[unsafe_offset=di + 0] = r
+                bmp[unsafe_offset=di + 1] = g
+                bmp[unsafe_offset=di + 2] = b
+                bmp[unsafe_offset=di + 3] = a
+
+def kp_border_rect[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, x: Int, y: Int, rw: Int, rh: Int, thickness: Int, c: UInt32, corner_cut: Int = 0):
+    if rw <= 0 or rh <= 0 or thickness <= 0:
+        return
+    var r = UInt8(c & UInt32(255))
+    var g = UInt8((c >> UInt32(8)) & UInt32(255))
+    var b = UInt8((c >> UInt32(16)) & UInt32(255))
+    var a = UInt8((c >> UInt32(24)) & UInt32(255))
+    for py in range(max(0, y), min(bh, y + rh)):
+        var dy_c = min(py - y, rh - 1 - (py - y))
+        for px in range(max(0, x), min(bw, x + rw)):
+            var dx_c = min(px - x, rw - 1 - (px - x))
+            var cd = dx_c + dy_c
+            if cd >= corner_cut and (dx_c < thickness or dy_c < thickness or (corner_cut > 0 and cd < corner_cut + thickness)):
+                var di = (py * bw + px) * 4
+                bmp[unsafe_offset=di + 0] = r
+                bmp[unsafe_offset=di + 1] = g
+                bmp[unsafe_offset=di + 2] = b
+                bmp[unsafe_offset=di + 3] = a
+
+def kp_draw_line[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, x0: Int, y0: Int, x1: Int, y1: Int, thickness: Int, c: UInt32):
+    var dx = abs(x1 - x0)
+    var dy = abs(y1 - y0)
+    var steps = max(1, max(dx, dy))
+    var rad = max(1, thickness)
+    var half = (rad - 1) // 2
+    for s in range(steps + 1):
+        var px = x0 + ((x1 - x0) * s) // steps
+        var py = y0 + ((y1 - y0) * s) // steps
+        kp_fill_rect(bmp, bw, bh, px - half, py - half, rad, rad, c)
+
+def kp_fill_circle[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, cx: Int, cy: Int, rad: Int, c: UInt32):
+    if rad <= 0:
+        return
+    var r = UInt8(c & UInt32(255))
+    var g = UInt8((c >> UInt32(8)) & UInt32(255))
+    var b = UInt8((c >> UInt32(16)) & UInt32(255))
+    var a = UInt8((c >> UInt32(24)) & UInt32(255))
+    var r2 = rad * rad
+    for py in range(max(0, cy - rad), min(bh, cy + rad + 1)):
+        var dy = py - cy
+        for px in range(max(0, cx - rad), min(bw, cx + rad + 1)):
+            var dx = px - cx
+            if dx * dx + dy * dy <= r2:
+                var di = (py * bw + px) * 4
+                bmp[unsafe_offset=di + 0] = r
+                bmp[unsafe_offset=di + 1] = g
+                bmp[unsafe_offset=di + 2] = b
+                bmp[unsafe_offset=di + 3] = a
+
+def kp_ring_circle[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, cx: Int, cy: Int, rad: Int, thickness: Int, c: UInt32):
+    if rad <= 0 or thickness <= 0:
+        return
+    var r = UInt8(c & UInt32(255))
+    var g = UInt8((c >> UInt32(8)) & UInt32(255))
+    var b = UInt8((c >> UInt32(16)) & UInt32(255))
+    var a = UInt8((c >> UInt32(24)) & UInt32(255))
+    var r_out2 = rad * rad
+    var r_in = max(0, rad - thickness)
+    var r_in2 = r_in * r_in
+    for py in range(max(0, cy - rad), min(bh, cy + rad + 1)):
+        var dy = py - cy
+        for px in range(max(0, cx - rad), min(bw, cx + rad + 1)):
+            var dx = px - cx
+            var d2 = dx * dx + dy * dy
+            if d2 <= r_out2 and d2 >= r_in2:
+                var di = (py * bw + px) * 4
+                bmp[unsafe_offset=di + 0] = r
+                bmp[unsafe_offset=di + 1] = g
+                bmp[unsafe_offset=di + 2] = b
+                bmp[unsafe_offset=di + 3] = a
+
+def _kp_p5x7(r0: UInt64, r1: UInt64, r2: UInt64, r3: UInt64, r4: UInt64, r5: UInt64, r6: UInt64) -> UInt64:
+    return (r0 << UInt64(30)) | (r1 << UInt64(25)) | (r2 << UInt64(20)) | (r3 << UInt64(15)) | (r4 << UInt64(10)) | (r5 << UInt64(5)) | r6
+
+def _kp_glyph_5x7(ch_in: Int) -> UInt64:
+    var ch = ch_in - 32 if (ch_in >= 97 and ch_in <= 122) else ch_in
+    var tbl = SIMD[DType.uint64, 64](
+        _kp_p5x7(14, 17, 17, 31, 17, 17, 17), _kp_p5x7(30, 17, 17, 30, 17, 17, 30), _kp_p5x7(14, 17, 16, 16, 16, 17, 14), _kp_p5x7(30, 17, 17, 17, 17, 17, 30),
+        _kp_p5x7(31, 16, 16, 30, 16, 16, 31), _kp_p5x7(31, 16, 16, 30, 16, 16, 16), _kp_p5x7(14, 17, 16, 23, 17, 17, 15), _kp_p5x7(17, 17, 17, 31, 17, 17, 17),
+        _kp_p5x7(14, 4, 4, 4, 4, 4, 14), _kp_p5x7(7, 2, 2, 2, 18, 18, 12), _kp_p5x7(17, 18, 20, 24, 20, 18, 17), _kp_p5x7(16, 16, 16, 16, 16, 16, 31),
+        _kp_p5x7(17, 27, 21, 21, 17, 17, 17), _kp_p5x7(17, 25, 21, 19, 17, 17, 17), _kp_p5x7(14, 17, 17, 17, 17, 17, 14), _kp_p5x7(30, 17, 17, 30, 16, 16, 16),
+        _kp_p5x7(14, 17, 17, 17, 21, 18, 13), _kp_p5x7(30, 17, 17, 30, 20, 18, 17), _kp_p5x7(15, 16, 16, 14, 1, 1, 30), _kp_p5x7(31, 4, 4, 4, 4, 4, 4),
+        _kp_p5x7(17, 17, 17, 17, 17, 17, 14), _kp_p5x7(17, 17, 17, 17, 17, 10, 4), _kp_p5x7(17, 17, 17, 21, 21, 27, 17), _kp_p5x7(17, 17, 10, 4, 10, 17, 17),
+        _kp_p5x7(17, 17, 10, 4, 4, 4, 4), _kp_p5x7(31, 1, 2, 4, 8, 16, 31), _kp_p5x7(14, 17, 19, 21, 25, 17, 14), _kp_p5x7(4, 12, 4, 4, 4, 4, 14),
+        _kp_p5x7(14, 17, 1, 6, 8, 16, 31), _kp_p5x7(30, 1, 1, 14, 1, 1, 30), _kp_p5x7(2, 6, 10, 18, 31, 2, 2), _kp_p5x7(31, 16, 30, 1, 1, 17, 14),
+        _kp_p5x7(6, 8, 16, 30, 17, 17, 14), _kp_p5x7(31, 1, 2, 4, 8, 8, 8), _kp_p5x7(14, 17, 17, 14, 17, 17, 14), _kp_p5x7(14, 17, 17, 15, 1, 2, 12),
+        _kp_p5x7(0, 4, 4, 0, 4, 4, 0), _kp_p5x7(0, 0, 0, 31, 0, 0, 0), _kp_p5x7(0, 0, 0, 0, 0, 0, 31), _kp_p5x7(0, 0, 0, 0, 0, 6, 6),
+        _kp_p5x7(1, 2, 2, 4, 8, 8, 16), _kp_p5x7(4, 4, 4, 4, 4, 0, 4), _kp_p5x7(0, 4, 4, 31, 4, 4, 0), _kp_p5x7(16, 8, 4, 2, 4, 8, 16),
+        _kp_p5x7(2, 4, 8, 16, 8, 4, 2), _kp_p5x7(4, 4, 4, 4, 4, 4, 4), _kp_p5x7(25, 25, 2, 4, 8, 19, 19), _kp_p5x7(6, 8, 8, 8, 8, 8, 6),
+        _kp_p5x7(12, 2, 2, 2, 2, 2, 12), _kp_p5x7(12, 18, 18, 12, 0, 0, 0), 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    )
+    if ch >= 65 and ch <= 90:
+        return tbl[ch - 65]
+    if ch >= 48 and ch <= 57:
+        return tbl[26 + ch - 48]
+    var sym = SIMD[DType.int32, 16](58, 45, 95, 46, 47, 33, 43, 62, 60, 124, 37, 40, 41, 126, -1, -1)
+    for k in range(14):
+        if ch == Int(sym[k]):
+            return tbl[36 + k]
+    return UInt64(0)
+
+def kp_draw_text[O: MutOrigin](bmp: Pointer[UInt8, O], bw: Int, bh: Int, x: Int, y: Int, text: String, scale: Int, c: UInt32):
+    var sc = max(1, scale)
+    var sb = text.as_bytes()
+    var n = len(sb)
+    for i in range(n):
+        var mask = _kp_glyph_5x7(Int(sb[i]))
+        if mask != UInt64(0):
+            var gx = x + i * 6 * sc
+            for ry in range(7):
+                var row_bits = (mask >> UInt64((6 - ry) * 5)) & UInt64(31)
+                if row_bits != UInt64(0):
+                    for rx in range(5):
+                        if (row_bits & (UInt64(1) << UInt64(4 - rx))) != UInt64(0):
+                            kp_fill_rect(bmp, bw, bh, gx + rx * sc, y + ry * sc, sc, sc, c)
+
+def kp_draw_text_aligned[O: MutOrigin](
+    bmp: Pointer[UInt8, O], bw: Int, bh: Int,
+    rx: Int, ry: Int, rw: Int, rh: Int,
+    text: String, scale: Int, c: UInt32, align_h: Int = 0,
+):
+    var sc = max(1, scale)
+    var tw = max(0, text.byte_length() * 6 * sc - sc)
+    var th = 7 * sc
+    var tx = rx
+    if align_h == 1:
+        tx = rx + (rw - tw) // 2
+    elif align_h == 2:
+        tx = rx + rw - tw
+    var ty = ry + (rh - th) // 2
+    kp_draw_text(bmp, bw, bh, tx, ty, text, sc, c)
 
 def _kp_read_file_str(path: String) -> String:
     var pc = path + String("\0")
