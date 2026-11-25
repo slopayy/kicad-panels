@@ -60,7 +60,7 @@ jobs:
           command -v glslangValidator >/dev/null 2>&1 || dnf install -y glslang spirv-tools vulkan-headers
           command -v xz >/dev/null 2>&1 || dnf install -y xz
           export CCACHE_DIR="$PWD/.ccache"
-          export CCACHE_SLOPPINESS=pch_defines,time_macros
+          export CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_ctime,include_file_mtime
           git init /tmp/kicad
           git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
           git -C /tmp/kicad checkout FETCH_HEAD
@@ -114,7 +114,7 @@ jobs:
           cmake --build "$RUNNER_TEMP/nng-build"
           cmake --install "$RUNNER_TEMP/nng-build"
           export CCACHE_DIR="$PWD/.ccache"
-          export CCACHE_SLOPPINESS=pch_defines,time_macros
+          export CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_ctime,include_file_mtime
           BREW_PREFIX="$(brew --prefix)"
           git init "$RUNNER_TEMP/kicad"
           git -C "$RUNNER_TEMP/kicad" fetch --depth 1 https://gitlab.com/kicad/code/kicad.git ${{ needs.patch.outputs.commit }}
@@ -125,6 +125,7 @@ jobs:
             -DCMAKE_C_COMPILER=/usr/bin/clang \
             -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
             -DCMAKE_OBJCXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_CXX_FLAGS="-Xclang -fno-pch-timestamp" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/deps" \
@@ -176,7 +177,7 @@ jobs:
             pkg clean -ay
           run: |
             export CCACHE_DIR="$PWD/.ccache"
-            export CCACHE_SLOPPINESS=pch_defines,time_macros
+            export CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_ctime,include_file_mtime
             git init /tmp/kicad
             git -C /tmp/kicad fetch --depth 1 https://gitlab.com/kicad/code/kicad.git "$KICAD_COMMIT"
             git -C /tmp/kicad checkout FETCH_HEAD
@@ -190,7 +191,7 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -DCMAKE_CXX_FLAGS="-D_LIBCPP_ENABLE_EXPERIMENTAL -DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED" \
+              -DCMAKE_CXX_FLAGS="-D_LIBCPP_ENABLE_EXPERIMENTAL -DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED -Xclang -fno-pch-timestamp" \
               -DCMAKE_INCLUDE_PATH="/tmp/kicad/include;/usr/local/include" \
               -DwxWidgets_CONFIG_EXECUTABLE=/usr/local/bin/wxgtk3u-3.2-config \
               -DOCC_INCLUDE_DIR=/usr/local/include/OpenCASCADE \
